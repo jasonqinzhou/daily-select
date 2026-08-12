@@ -1,6 +1,6 @@
 # Daily Select
 
-Daily Select is a private, on-device photo and video selector for macOS. Point
+Daily Select is a privacy-first, on-device photo and video selector for macOS. Point
 it at a local folder and it copies a conservative set of strong, varied moments
 into one flat folder per capture date.
 
@@ -27,7 +27,9 @@ thumbnails, metadata, or model requests leave your Mac.
 - Frame sampling for MOV, MP4, and M4V video
 - Memory-bounded photo thumbnails with automatic smaller-size retries
 - Flat `YYYY-MM-DD` output folders with byte-identical copies
-- An auditable JSON manifest containing scores, labels, groups, and decisions
+- Bounded analysis batches with an atomic checkpoint after every batch
+- Safe resume after interruption: unchanged completed media is not analyzed again
+- Auditable per-batch JSON manifests containing scores, labels, groups, and decisions
 - Idempotent reruns: existing identical selections are reused
 
 ## Requirements
@@ -64,6 +66,8 @@ The input and output directories must not overlap.
 --ratio 0.35              Fraction selected within each date/topic balance
 --max-per-topic 12        Maximum selected within each internal topic balance
 --photo-max-pixels 2048   Longest edge used for photo analysis (minimum: 512)
+--batch-size 1000         New media analyzed before each checkpoint
+--max-batches NUMBER      Stop after this many batches and resume on the next run
 -h, --help                Show command help
 ```
 
@@ -72,6 +76,31 @@ Example:
 ```bash
 .build/release/daily-select --dry-run --ratio 0.30 "/path/to/Photos"
 ```
+
+## Batches and checkpoints
+
+By default, Daily Select analyzes at most 1,000 new or changed files at a time.
+After each batch it copies that batch's selections, writes a per-batch manifest,
+and atomically updates `_daily-select-checkpoint.json`. It then continues with
+the next batch automatically.
+
+Run the exact same command after a crash, shutdown, or manual stop. Files whose
+size and modification time still match the checkpoint are skipped; new or
+changed files are analyzed. A small set of candidates near the chronological
+batch boundary is carried into the next batch so a burst split at item 1,000 is
+still compared together. The source folder remains read-only throughout.
+
+For a scheduled or deliberately bounded run, process one batch per invocation:
+
+```bash
+.build/release/daily-select --batch-size 1000 --max-batches 1 \
+  "/path/to/Photos" "/path/to/Daily Select"
+```
+
+`--ratio`, `--max-per-topic`, `--photo-max-pixels`, and `--batch-size` are part
+of the checkpointed selection policy. Resume with the same values. To use
+different policy settings, choose a new output folder so results from two
+policies are not mixed.
 
 ## How selection works
 
@@ -94,9 +123,10 @@ Example:
 For videos, AVFoundation samples frames near the beginning, middle, and end,
 then copies the complete original video when selected.
 
-## Manifest
+## Manifests
 
-Each run writes `_daily-select-manifest.json` in the output root. It records:
+Each committed batch writes `_daily-select-batches/batch-NNNNNN.json`. Those
+batch manifests record:
 
 - Source and destination paths
 - Capture dates and media types
@@ -104,11 +134,16 @@ Each run writes `_daily-select-manifest.json` in the output root. It records:
 - Semantic labels and internal topic
 - Near-duplicate group identifiers
 - Selection or rejection reason
-- Run settings, counts, and failures
+- Batch counts and failures
 - Whether each asset received full, partial, or basic fallback analysis
 
-The manifest is local and may contain absolute filesystem paths. Review it
-before sharing it publicly.
+The compact `_daily-select-manifest.json` is the current run index and cumulative
+summary. `_daily-select-checkpoint.json` is the machine-readable resume state.
+Both are updated atomically after the selected originals and batch manifest are
+successfully written.
+
+The manifests and checkpoint are local and may contain absolute filesystem
+paths. Review them before sharing them publicly.
 
 ## Privacy and limitations
 

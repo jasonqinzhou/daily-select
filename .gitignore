@@ -5,3 +5,5 @@
 *.xcworkspace/
 selection-preview.jpg
 _daily-select-manifest.json
+_daily-select-checkpoint.json
+_daily-select-batches/

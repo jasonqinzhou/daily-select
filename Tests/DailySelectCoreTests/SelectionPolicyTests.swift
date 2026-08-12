@@ -47,3 +47,22 @@ import Testing
     )
     #expect(result == [0, 2, 3])
 }
+
+@Test func dividesWorkIntoBoundedBatches() {
+    let slices = batchSlices(Array(0..<2_501), batchSize: 1_000)
+    #expect(slices.map(\.count) == [1_000, 1_000, 501])
+    #expect(Array(slices[1].prefix(2)) == [1_000, 1_001])
+}
+
+@Test func checkpointInvalidatesAChangedSource() {
+    let original = SourceFingerprint(byteSize: 42, modificationTime: 100)
+    #expect(checkpointMatches(stored: original, current: original))
+    #expect(!checkpointMatches(
+        stored: original,
+        current: SourceFingerprint(byteSize: 43, modificationTime: 100)
+    ))
+    #expect(!checkpointMatches(
+        stored: original,
+        current: SourceFingerprint(byteSize: 42, modificationTime: 101)
+    ))
+}

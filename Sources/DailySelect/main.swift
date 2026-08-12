@@ -38,6 +38,8 @@ struct FrameAnalysis {
 
 final class Candidate {
     let sourceURL: URL
+    let relativePath: String
+    let fingerprint: SourceFingerprint
     let kind: MediaKind
     let captureDate: Date
     let byteSize: Int64
@@ -49,8 +51,18 @@ final class Candidate {
     var decision = "Not evaluated"
     var copiedTo: String?
 
-    init(sourceURL: URL, kind: MediaKind, captureDate: Date, byteSize: Int64, analysis: FrameAnalysis) {
+    init(
+        sourceURL: URL,
+        relativePath: String,
+        fingerprint: SourceFingerprint,
+        kind: MediaKind,
+        captureDate: Date,
+        byteSize: Int64,
+        analysis: FrameAnalysis
+    ) {
         self.sourceURL = sourceURL
+        self.relativePath = relativePath
+        self.fingerprint = fingerprint
         self.kind = kind
         self.captureDate = captureDate
         self.byteSize = byteSize
@@ -58,16 +70,19 @@ final class Candidate {
     }
 }
 
-struct Settings: Codable {
+struct Settings: Codable, Equatable {
     let selectionRatio: Double
     let maximumPerTopic: Int
     let photoAnalysisMaxPixels: Int
+    let batchSize: Int
     let nearDuplicateSeconds: Double
     let nearDuplicateDistance: Float
+    let boundaryCarryoverLimit: Int
 }
 
 struct AssetRecord: Codable {
     let source: String
+    let relativePath: String
     let captureDate: String
     let mediaType: String
     let bytes: Int64
@@ -88,6 +103,9 @@ struct AssetRecord: Codable {
 
 struct Summary: Codable {
     let discovered: Int
+    let completed: Int
+    let remaining: Int
+    let pendingBoundary: Int
     let analyzed: Int
     let selected: Int
     let skipped: Int
@@ -106,8 +124,84 @@ struct RunManifest: Codable {
     let dryRun: Bool
     let settings: Settings
     let summary: Summary
+    let checkpoint: String?
+    let batchManifests: [String]
+}
+
+struct SourceDescriptor {
+    let sourceURL: URL
+    let relativePath: String
+    let kind: MediaKind
+    let captureDate: Date
+    let fingerprint: SourceFingerprint
+}
+
+struct PersistedAnalysis: Codable {
+    let aesthetics: Float
+    let isUtility: Bool
+    let faceQuality: Float?
+    let faceCount: Int
+    let eyewearConfidence: Float
+    let labels: [LabelScore]
+    let featurePrintArchive: Data?
+    let analysisMode: AnalysisMode
+}
+
+struct PendingCandidate: Codable {
+    let relativePath: String
+    let fingerprint: SourceFingerprint
+    let kind: MediaKind
+    let captureDate: Date
+    let analysis: PersistedAnalysis
+    let topic: String
+    let score: Float
+}
+
+struct CompletedFile: Codable {
+    let fingerprint: SourceFingerprint
+    let batchNumber: Int
+    let outcome: String
+}
+
+struct BatchFailure: Codable {
+    let source: String
+    let relativePath: String
+    let error: String
+}
+
+struct BatchSummary: Codable {
+    let batchNumber: Int
+    let manifest: String
+    let newlyAnalyzed: Int
+    let reusedBoundary: Int
+    let finalized: Int
+    let selected: Int
+    let skipped: Int
+    let copied: Int
+    let alreadyPresent: Int
+    let failed: Int
+    let degradedPhotos: Int
+    let selectedByDateAndTopic: [String: [String: Int]]
+}
+
+struct BatchManifest: Codable {
+    let schemaVersion: Int
+    let generatedAt: String
+    let inputRoot: String
+    let outputRoot: String
+    let summary: BatchSummary
     let assets: [AssetRecord]
-    let failures: [String]
+    let failures: [BatchFailure]
+}
+
+struct CheckpointState: Codable {
+    let schemaVersion: Int
+    let inputRoot: String
+    let settings: Settings
+    var nextBatchNumber: Int
+    var completed: [String: CompletedFile]
+    var pending: [PendingCandidate]
+    var batches: [BatchSummary]
 }
 
 struct Options {
@@ -117,6 +211,8 @@ struct Options {
     let ratio: Double
     let maxPerTopic: Int
     let photoMaxPixels: Int
+    let batchSize: Int
+    let maxBatches: Int?
 }
 
 enum DailySelectError: Error, CustomStringConvertible {
@@ -137,6 +233,7 @@ private let settingsNearDuplicateDistance: Float = 0.36
 private let eyewearThreshold: Float = 0.45
 private let distinctViewDistance: Float = 0.25
 private let defaultPhotoMaxPixels = 2_048
+private let defaultBatchSize = 1_000
 
 func expandedURL(_ path: String) -> URL {
     let expanded = NSString(string: path).expandingTildeInPath
@@ -149,6 +246,8 @@ func parseOptions() throws -> Options {
     var ratio = 0.35
     var maxPerTopic = 12
     var photoMaxPixels = defaultPhotoMaxPixels
+    var batchSize = defaultBatchSize
+    var maxBatches: Int?
     var iterator = CommandLine.arguments.dropFirst().makeIterator()
 
     while let argument = iterator.next() {
@@ -170,6 +269,16 @@ func parseOptions() throws -> Options {
                 throw DailySelectError.usage("--photo-max-pixels must be an integer of at least 512")
             }
             photoMaxPixels = parsed
+        case "--batch-size":
+            guard let value = iterator.next(), let parsed = Int(value), parsed > 0 else {
+                throw DailySelectError.usage("--batch-size must be a positive integer")
+            }
+            batchSize = parsed
+        case "--max-batches":
+            guard let value = iterator.next(), let parsed = Int(value), parsed > 0 else {
+                throw DailySelectError.usage("--max-batches must be a positive integer")
+            }
+            maxBatches = parsed
         case "--help", "-h":
             throw DailySelectError.usage(usage())
         default:
@@ -195,7 +304,9 @@ func parseOptions() throws -> Options {
         dryRun: dryRun,
         ratio: ratio,
         maxPerTopic: maxPerTopic,
-        photoMaxPixels: photoMaxPixels
+        photoMaxPixels: photoMaxPixels,
+        batchSize: batchSize,
+        maxBatches: maxBatches
     )
 }
 
@@ -206,8 +317,10 @@ func usage() -> String {
     Options:
       --dry-run                 Analyze and report without copying files
       --ratio NUMBER            Target fraction selected per topic (default: 0.35)
-      --max-per-topic NUMBER    Maximum selected per date/topic (default: 12)
+      --max-per-topic NUMBER    Maximum selected per batch/date/topic (default: 12)
       --photo-max-pixels NUMBER Longest photo-analysis edge (default: 2048; minimum: 512)
+      --batch-size NUMBER       New media analyzed before each checkpoint (default: 1000)
+      --max-batches NUMBER      Stop cleanly after this many batches; resume next run
       -h, --help                Show this help
 
     The input is always read-only. If OUTPUT_FOLDER is omitted, the tool creates
@@ -228,8 +341,19 @@ func validatePaths(_ options: Options) throws {
     }
 }
 
-func discoverMedia(in root: URL) throws -> [(URL, MediaKind)] {
-    let keys: [URLResourceKey] = [.isRegularFileKey, .isHiddenKey]
+func relativePath(for url: URL, under root: URL) -> String {
+    let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+    guard url.path.hasPrefix(rootPath) else { return url.lastPathComponent }
+    return String(url.path.dropFirst(rootPath.count))
+}
+
+func discoverMedia(in root: URL) throws -> [SourceDescriptor] {
+    let keys: [URLResourceKey] = [
+        .isRegularFileKey,
+        .isHiddenKey,
+        .fileSizeKey,
+        .contentModificationDateKey,
+    ]
     guard let enumerator = FileManager.default.enumerator(
         at: root,
         includingPropertiesForKeys: keys,
@@ -238,19 +362,35 @@ func discoverMedia(in root: URL) throws -> [(URL, MediaKind)] {
         return []
     }
 
-    var media: [(URL, MediaKind)] = []
+    var media: [SourceDescriptor] = []
     for case let url as URL in enumerator {
         let values = try? url.resourceValues(forKeys: Set(keys))
         guard values?.isRegularFile == true, values?.isHidden != true else { continue }
         let ext = url.pathExtension.lowercased()
+        let kind: MediaKind
         if imageExtensions.contains(ext) {
-            media.append((url, .image))
+            kind = .image
         } else if videoExtensions.contains(ext) {
-            media.append((url, .video))
+            kind = .video
+        } else {
+            continue
         }
+
+        let byteSize = Int64(values?.fileSize ?? 0)
+        let modificationTime = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+        media.append(SourceDescriptor(
+            sourceURL: url,
+            relativePath: relativePath(for: url, under: root),
+            kind: kind,
+            captureDate: captureDate(for: url, kind: kind),
+            fingerprint: SourceFingerprint(byteSize: byteSize, modificationTime: modificationTime)
+        ))
     }
 
-    return media.sorted { $0.0.path.localizedStandardCompare($1.0.path) == .orderedAscending }
+    return media.sorted {
+        if $0.captureDate != $1.captureDate { return $0.captureDate < $1.captureDate }
+        return $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+    }
 }
 
 func dateFromFilename(_ filename: String) -> Date? {
@@ -298,11 +438,6 @@ func captureDate(for url: URL, kind: MediaKind) -> Date {
 
     let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
     return values?.creationDate ?? values?.contentModificationDate ?? Date()
-}
-
-func fileSize(_ url: URL) -> Int64 {
-    let values = try? url.resourceValues(forKeys: [.fileSizeKey])
-    return Int64(values?.fileSize ?? 0)
 }
 
 struct FaceMetrics {
@@ -744,12 +879,12 @@ func groupRepresentatives(_ group: [Candidate]) -> [(candidate: Candidate, reaso
     }
 }
 
-func selectCandidates(_ candidates: [Candidate], ratio: Double, maxPerTopic: Int) {
+func selectCandidates(_ candidates: [Candidate], ratio: Double, maxPerTopic: Int, batchNumber: Int) {
     let groups = groupNearDuplicates(candidates)
     var representatives: [Candidate] = []
 
     for (index, group) in groups.enumerated() {
-        let groupID = String(format: "group-%04d", index + 1)
+        let groupID = String(format: "batch-%06d-group-%04d", batchNumber, index + 1)
         for candidate in group { candidate.groupID = groupID }
 
         let chosen = groupRepresentatives(group)
@@ -797,6 +932,156 @@ func selectCandidates(_ candidates: [Candidate], ratio: Double, maxPerTopic: Int
     }
 }
 
+func archiveFeaturePrint(_ featurePrint: VNFeaturePrintObservation?) throws -> Data? {
+    guard let featurePrint else { return nil }
+    return try NSKeyedArchiver.archivedData(withRootObject: featurePrint, requiringSecureCoding: true)
+}
+
+func restoreFeaturePrint(_ data: Data?) throws -> VNFeaturePrintObservation? {
+    guard let data else { return nil }
+    return try NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: data)
+}
+
+func persistedCandidate(_ candidate: Candidate) throws -> PendingCandidate {
+    PendingCandidate(
+        relativePath: candidate.relativePath,
+        fingerprint: candidate.fingerprint,
+        kind: candidate.kind,
+        captureDate: candidate.captureDate,
+        analysis: PersistedAnalysis(
+            aesthetics: candidate.analysis.aesthetics,
+            isUtility: candidate.analysis.isUtility,
+            faceQuality: candidate.analysis.faceQuality,
+            faceCount: candidate.analysis.faceCount,
+            eyewearConfidence: candidate.analysis.eyewearConfidence,
+            labels: candidate.analysis.labels,
+            featurePrintArchive: try archiveFeaturePrint(candidate.analysis.featurePrint),
+            analysisMode: candidate.analysis.analysisMode
+        ),
+        topic: candidate.topic,
+        score: candidate.score
+    )
+}
+
+func restoredCandidate(_ pending: PendingCandidate, descriptor: SourceDescriptor) throws -> Candidate? {
+    guard checkpointMatches(stored: pending.fingerprint, current: descriptor.fingerprint) else { return nil }
+    let candidate = Candidate(
+        sourceURL: descriptor.sourceURL,
+        relativePath: descriptor.relativePath,
+        fingerprint: descriptor.fingerprint,
+        kind: pending.kind,
+        captureDate: pending.captureDate,
+        byteSize: descriptor.fingerprint.byteSize,
+        analysis: FrameAnalysis(
+            aesthetics: pending.analysis.aesthetics,
+            isUtility: pending.analysis.isUtility,
+            faceQuality: pending.analysis.faceQuality,
+            faceCount: pending.analysis.faceCount,
+            eyewearConfidence: pending.analysis.eyewearConfidence,
+            labels: pending.analysis.labels,
+            featurePrint: try restoreFeaturePrint(pending.analysis.featurePrintArchive),
+            analysisMode: pending.analysis.analysisMode
+        )
+    )
+    candidate.topic = pending.topic
+    candidate.score = pending.score
+    return candidate
+}
+
+func partitionForCheckpoint(
+    _ candidates: [Candidate],
+    isFinalBatch: Bool,
+    carryoverLimit: Int
+) -> (finalized: [Candidate], pending: [Candidate]) {
+    guard !isFinalBatch, let newestDate = candidates.map(\.captureDate).max() else {
+        return (candidates, [])
+    }
+
+    let boundaryDate = newestDate.addingTimeInterval(-settingsNearDuplicateSeconds)
+    let groups = groupNearDuplicates(candidates)
+    var finalized: [Candidate] = []
+    var pending: [Candidate] = []
+    for group in groups {
+        if group.contains(where: { $0.captureDate >= boundaryDate }) {
+            pending.append(contentsOf: group)
+        } else {
+            finalized.append(contentsOf: group)
+        }
+    }
+
+    if pending.count > carryoverLimit {
+        let chronological = pending.sorted { $0.captureDate < $1.captureDate }
+        let overflowCount = chronological.count - carryoverLimit
+        finalized.append(contentsOf: chronological.prefix(overflowCount))
+        pending = Array(chronological.suffix(carryoverLimit))
+    }
+    return (
+        finalized.sorted { $0.captureDate < $1.captureDate },
+        pending.sorted { $0.captureDate < $1.captureDate }
+    )
+}
+
+func assetRecord(for candidate: Candidate) -> AssetRecord {
+    AssetRecord(
+        source: candidate.sourceURL.path,
+        relativePath: candidate.relativePath,
+        captureDate: isoDate(candidate.captureDate),
+        mediaType: candidate.kind.rawValue,
+        bytes: candidate.byteSize,
+        topic: candidate.topic,
+        aestheticScore: candidate.analysis.aesthetics,
+        faceQuality: candidate.analysis.faceQuality,
+        faceCount: candidate.analysis.faceCount,
+        eyewearConfidence: candidate.analysis.eyewearConfidence,
+        appearanceVariant: appearanceVariant(candidate),
+        utilityImage: candidate.analysis.isUtility,
+        labels: candidate.analysis.labels,
+        analysisMode: candidate.analysis.analysisMode.rawValue,
+        duplicateGroup: candidate.groupID,
+        selected: candidate.selected,
+        decision: candidate.decision,
+        copiedTo: candidate.copiedTo
+    )
+}
+
+func mergedTopicCounts(_ batches: [BatchSummary]) -> [String: [String: Int]] {
+    var result: [String: [String: Int]] = [:]
+    for batch in batches {
+        for (date, topics) in batch.selectedByDateAndTopic {
+            for (topic, count) in topics {
+                result[date, default: [:]][topic, default: 0] += count
+            }
+        }
+    }
+    return result
+}
+
+func aggregateSummary(
+    checkpoint: CheckpointState,
+    discovered: [SourceDescriptor]
+) -> Summary {
+    let currentByPath = Dictionary(uniqueKeysWithValues: discovered.map { ($0.relativePath, $0) })
+    let completedCurrent = checkpoint.completed.filter { path, state in
+        guard let descriptor = currentByPath[path] else { return false }
+        return checkpointMatches(stored: state.fingerprint, current: descriptor.fingerprint)
+    }.count
+    let batches = checkpoint.batches
+    return Summary(
+        discovered: discovered.count,
+        completed: completedCurrent,
+        remaining: max(0, discovered.count - completedCurrent - checkpoint.pending.count),
+        pendingBoundary: checkpoint.pending.count,
+        analyzed: batches.reduce(0) { $0 + $1.newlyAnalyzed },
+        selected: batches.reduce(0) { $0 + $1.selected },
+        skipped: batches.reduce(0) { $0 + $1.skipped },
+        copied: batches.reduce(0) { $0 + $1.copied },
+        alreadyPresent: batches.reduce(0) { $0 + $1.alreadyPresent },
+        failed: batches.reduce(0) { $0 + $1.failed },
+        degradedPhotos: batches.reduce(0) { $0 + $1.degradedPhotos },
+        selectedByDateAndTopic: mergedTopicCounts(batches)
+    )
+}
+
 func destinationForCopy(source: URL, directory: URL) -> (url: URL, alreadyPresent: Bool) {
     let manager = FileManager.default
     let initial = directory.appendingPathComponent(source.lastPathComponent)
@@ -815,11 +1100,75 @@ func destinationForCopy(source: URL, directory: URL) -> (url: URL, alreadyPresen
     }
 }
 
-func writeManifest(_ manifest: RunManifest, output: URL) throws {
+private let checkpointFileName = "_daily-select-checkpoint.json"
+private let runManifestFileName = "_daily-select-manifest.json"
+private let batchManifestDirectoryName = "_daily-select-batches"
+
+func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-    let data = try encoder.encode(manifest)
-    try data.write(to: output.appendingPathComponent("_daily-select-manifest.json"), options: .atomic)
+    let data = try encoder.encode(value)
+    try data.write(to: url, options: .atomic)
+}
+
+func loadCheckpoint(options: Options, settings: Settings) throws -> CheckpointState {
+    let url = options.output.appendingPathComponent(checkpointFileName)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return CheckpointState(
+            schemaVersion: 1,
+            inputRoot: options.input.path,
+            settings: settings,
+            nextBatchNumber: 1,
+            completed: [:],
+            pending: [],
+            batches: []
+        )
+    }
+
+    let checkpoint: CheckpointState
+    do {
+        checkpoint = try JSONDecoder().decode(CheckpointState.self, from: Data(contentsOf: url))
+    } catch {
+        throw DailySelectError.invalidPath(
+            "Cannot read checkpoint at \(url.path): \(error). Move it aside to start a fresh output history."
+        )
+    }
+    guard checkpoint.schemaVersion == 1 else {
+        throw DailySelectError.invalidPath(
+            "Unsupported checkpoint schema \(checkpoint.schemaVersion) at \(url.path)"
+        )
+    }
+    guard checkpoint.inputRoot == options.input.path else {
+        throw DailySelectError.invalidPath(
+            "The output checkpoint belongs to a different input folder: \(checkpoint.inputRoot)"
+        )
+    }
+    guard checkpoint.settings == settings else {
+        throw DailySelectError.invalidPath(
+            "Selection settings differ from the existing checkpoint. Resume with the same --ratio, "
+                + "--max-per-topic, --photo-max-pixels, and --batch-size values, or choose a new output folder."
+        )
+    }
+    return checkpoint
+}
+
+func writeRunManifest(
+    checkpoint: CheckpointState,
+    discovered: [SourceDescriptor],
+    options: Options
+) throws {
+    let manifest = RunManifest(
+        schemaVersion: 3,
+        generatedAt: isoDate(Date()),
+        inputRoot: options.input.path,
+        outputRoot: options.output.path,
+        dryRun: options.dryRun,
+        settings: checkpoint.settings,
+        summary: aggregateSummary(checkpoint: checkpoint, discovered: discovered),
+        checkpoint: checkpointFileName,
+        batchManifests: checkpoint.batches.map(\.manifest)
+    )
+    try writeJSON(manifest, to: options.output.appendingPathComponent(runManifestFileName))
 }
 
 func run() async throws {
@@ -830,125 +1179,224 @@ func run() async throws {
         throw DailySelectError.noMedia("No supported photos or videos found in \(options.input.path)")
     }
 
+    let settings = Settings(
+        selectionRatio: options.ratio,
+        maximumPerTopic: options.maxPerTopic,
+        photoAnalysisMaxPixels: options.photoMaxPixels,
+        batchSize: options.batchSize,
+        nearDuplicateSeconds: settingsNearDuplicateSeconds,
+        nearDuplicateDistance: settingsNearDuplicateDistance,
+        boundaryCarryoverLimit: options.batchSize
+    )
+    if !options.dryRun {
+        try FileManager.default.createDirectory(at: options.output, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: options.output.appendingPathComponent(batchManifestDirectoryName, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+    }
+
+    var checkpoint = try loadCheckpoint(options: options, settings: settings)
+    let descriptorByPath = Dictionary(uniqueKeysWithValues: discovered.map { ($0.relativePath, $0) })
+
+    var carriedCandidates: [Candidate] = []
+    var validPendingPaths: Set<String> = []
+    for pending in checkpoint.pending {
+        guard let descriptor = descriptorByPath[pending.relativePath],
+              checkpointMatches(stored: pending.fingerprint, current: descriptor.fingerprint) else {
+            continue
+        }
+        do {
+            if let candidate = try restoredCandidate(pending, descriptor: descriptor) {
+                carriedCandidates.append(candidate)
+                validPendingPaths.insert(pending.relativePath)
+            }
+        } catch {
+            print("Checkpoint boundary entry will be analyzed again: \(pending.relativePath) (\(error))")
+        }
+    }
+    checkpoint.pending = try carriedCandidates.map(persistedCandidate)
+
+    let completedPaths = Set(discovered.compactMap { descriptor -> String? in
+        guard checkpointMatches(
+            stored: checkpoint.completed[descriptor.relativePath]?.fingerprint,
+            current: descriptor.fingerprint
+        ) else { return nil }
+        return descriptor.relativePath
+    })
+    let unprocessed = discovered.filter {
+        !completedPaths.contains($0.relativePath) && !validPendingPaths.contains($0.relativePath)
+    }
+
     print("Daily Select")
     print("Input:  \(options.input.path)")
     print("Output: \(options.output.path)\(options.dryRun ? " (dry run)" : "")")
     print("Found \(discovered.count) supported media files")
+    print("Resume state: \(completedPaths.count) complete, \(carriedCandidates.count) at a batch boundary, \(unprocessed.count) new or changed")
 
-    var candidates: [Candidate] = []
-    var failures: [String] = []
-    for (index, item) in discovered.enumerated() {
-        let (url, kind) = item
-        do {
-            let analysis: FrameAnalysis
-            if kind == .image {
-                analysis = try analyzeImage(url, maximumPixelSize: options.photoMaxPixels)
-            } else {
-                analysis = try await analyzeVideo(url)
+    var workBatches = batchSlices(unprocessed, batchSize: options.batchSize).map(Array.init)
+    if workBatches.isEmpty && !carriedCandidates.isEmpty {
+        workBatches = [[]]
+    }
+    let batchesThisRun = min(options.maxBatches ?? workBatches.count, workBatches.count)
+    var runFailures: [BatchFailure] = []
+
+    for batchIndex in 0..<batchesThisRun {
+        let batchDescriptors = workBatches[batchIndex]
+        let batchNumber = checkpoint.nextBatchNumber
+        let isFinalBatch = batchIndex == workBatches.count - 1
+        let reusedBoundary = carriedCandidates.count
+        var candidates = carriedCandidates
+        var failedDescriptors: [(descriptor: SourceDescriptor, failure: BatchFailure)] = []
+
+        print("Batch \(batchNumber): analyzing \(batchDescriptors.count) new media")
+        for (index, descriptor) in batchDescriptors.enumerated() {
+            do {
+                let analysis: FrameAnalysis
+                if descriptor.kind == .image {
+                    analysis = try analyzeImage(
+                        descriptor.sourceURL,
+                        maximumPixelSize: options.photoMaxPixels
+                    )
+                } else {
+                    analysis = try await analyzeVideo(descriptor.sourceURL)
+                }
+                let candidate = Candidate(
+                    sourceURL: descriptor.sourceURL,
+                    relativePath: descriptor.relativePath,
+                    fingerprint: descriptor.fingerprint,
+                    kind: descriptor.kind,
+                    captureDate: descriptor.captureDate,
+                    byteSize: descriptor.fingerprint.byteSize,
+                    analysis: analysis
+                )
+                candidate.topic = assignTopic(to: candidate)
+                candidate.score = candidateScore(candidate)
+                candidates.append(candidate)
+            } catch {
+                let failure = BatchFailure(
+                    source: descriptor.sourceURL.path,
+                    relativePath: descriptor.relativePath,
+                    error: String(describing: error)
+                )
+                failedDescriptors.append((descriptor, failure))
+                runFailures.append(failure)
             }
-            let candidate = Candidate(
-                sourceURL: url,
-                kind: kind,
-                captureDate: captureDate(for: url, kind: kind),
-                byteSize: fileSize(url),
-                analysis: analysis
-            )
-            candidate.topic = assignTopic(to: candidate)
-            candidate.score = candidateScore(candidate)
-            candidates.append(candidate)
-        } catch {
-            failures.append("\(url.path): \(error)")
+            print("Batch \(batchNumber): analyzed \(index + 1)/\(batchDescriptors.count)", terminator: "\r")
+            fflush(stdout)
         }
-        print("Analyzed \(index + 1)/\(discovered.count)", terminator: "\r")
-        fflush(stdout)
-    }
-    print(String(repeating: " ", count: 40), terminator: "\r")
+        if !batchDescriptors.isEmpty {
+            print(String(repeating: " ", count: 72), terminator: "\r")
+        }
 
-    selectCandidates(candidates, ratio: options.ratio, maxPerTopic: options.maxPerTopic)
+        let partition = partitionForCheckpoint(
+            candidates,
+            isFinalBatch: isFinalBatch,
+            carryoverLimit: settings.boundaryCarryoverLimit
+        )
+        let finalized = partition.finalized
+        carriedCandidates = partition.pending
+        selectCandidates(
+            finalized,
+            ratio: options.ratio,
+            maxPerTopic: options.maxPerTopic,
+            batchNumber: batchNumber
+        )
 
-    var copied = 0
-    var alreadyPresent = 0
-    if !options.dryRun {
-        try FileManager.default.createDirectory(at: options.output, withIntermediateDirectories: true)
-        for candidate in candidates.filter(\.selected).sorted(by: { $0.captureDate < $1.captureDate }) {
-            let directory = dailyOutputDirectory(
-                outputRoot: options.output,
-                dateKey: dateKey(candidate.captureDate)
-            )
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let destination = destinationForCopy(source: candidate.sourceURL, directory: directory)
-            if destination.alreadyPresent {
-                alreadyPresent += 1
-            } else {
-                try FileManager.default.copyItem(at: candidate.sourceURL, to: destination.url)
-                copied += 1
+        var copied = 0
+        var alreadyPresent = 0
+        if !options.dryRun {
+            for candidate in finalized.filter(\.selected).sorted(by: { $0.captureDate < $1.captureDate }) {
+                let directory = dailyOutputDirectory(
+                    outputRoot: options.output,
+                    dateKey: dateKey(candidate.captureDate)
+                )
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let destination = destinationForCopy(source: candidate.sourceURL, directory: directory)
+                if destination.alreadyPresent {
+                    alreadyPresent += 1
+                } else {
+                    try FileManager.default.copyItem(at: candidate.sourceURL, to: destination.url)
+                    copied += 1
+                }
+                candidate.copiedTo = destination.url.path
             }
-            candidate.copiedTo = destination.url.path
         }
-    }
 
-    var selectedByDateAndTopic: [String: [String: Int]] = [:]
-    for candidate in candidates.filter(\.selected) {
-        selectedByDateAndTopic[dateKey(candidate.captureDate), default: [:]][candidate.topic, default: 0] += 1
-    }
+        var selectedByDateAndTopic: [String: [String: Int]] = [:]
+        for candidate in finalized.filter(\.selected) {
+            selectedByDateAndTopic[dateKey(candidate.captureDate), default: [:]][candidate.topic, default: 0] += 1
+        }
+        let batchManifestName = String(format: "batch-%06d.json", batchNumber)
+        let batchManifestPath = "\(batchManifestDirectoryName)/\(batchManifestName)"
+        let batchSummary = BatchSummary(
+            batchNumber: batchNumber,
+            manifest: batchManifestPath,
+            newlyAnalyzed: batchDescriptors.count,
+            reusedBoundary: reusedBoundary,
+            finalized: finalized.count,
+            selected: finalized.filter(\.selected).count,
+            skipped: finalized.filter { !$0.selected }.count,
+            copied: copied,
+            alreadyPresent: alreadyPresent,
+            failed: failedDescriptors.count,
+            degradedPhotos: finalized.filter {
+                $0.kind == .image && $0.analysis.analysisMode != .full
+            }.count,
+            selectedByDateAndTopic: selectedByDateAndTopic
+        )
+        let batchManifest = BatchManifest(
+            schemaVersion: 1,
+            generatedAt: isoDate(Date()),
+            inputRoot: options.input.path,
+            outputRoot: options.output.path,
+            summary: batchSummary,
+            assets: finalized.sorted { $0.captureDate < $1.captureDate }.map(assetRecord),
+            failures: failedDescriptors.map(\.failure)
+        )
 
-    let records = candidates.sorted { $0.captureDate < $1.captureDate }.map { candidate in
-        AssetRecord(
-            source: candidate.sourceURL.path,
-            captureDate: isoDate(candidate.captureDate),
-            mediaType: candidate.kind.rawValue,
-            bytes: candidate.byteSize,
-            topic: candidate.topic,
-            aestheticScore: candidate.analysis.aesthetics,
-            faceQuality: candidate.analysis.faceQuality,
-            faceCount: candidate.analysis.faceCount,
-            eyewearConfidence: candidate.analysis.eyewearConfidence,
-            appearanceVariant: appearanceVariant(candidate),
-            utilityImage: candidate.analysis.isUtility,
-            labels: candidate.analysis.labels,
-            analysisMode: candidate.analysis.analysisMode.rawValue,
-            duplicateGroup: candidate.groupID,
-            selected: candidate.selected,
-            decision: candidate.decision,
-            copiedTo: candidate.copiedTo
+        for candidate in finalized {
+            checkpoint.completed[candidate.relativePath] = CompletedFile(
+                fingerprint: candidate.fingerprint,
+                batchNumber: batchNumber,
+                outcome: candidate.selected ? "selected" : "skipped"
+            )
+        }
+        for item in failedDescriptors {
+            checkpoint.completed[item.descriptor.relativePath] = CompletedFile(
+                fingerprint: item.descriptor.fingerprint,
+                batchNumber: batchNumber,
+                outcome: "failed"
+            )
+        }
+        checkpoint.pending = try carriedCandidates.map(persistedCandidate)
+        checkpoint.batches.append(batchSummary)
+        checkpoint.nextBatchNumber += 1
+
+        if !options.dryRun {
+            let batchURL = options.output
+                .appendingPathComponent(batchManifestDirectoryName, isDirectory: true)
+                .appendingPathComponent(batchManifestName)
+            try writeJSON(batchManifest, to: batchURL)
+            try writeJSON(checkpoint, to: options.output.appendingPathComponent(checkpointFileName))
+            try writeRunManifest(checkpoint: checkpoint, discovered: discovered, options: options)
+        }
+        let batchAction = options.dryRun ? "simulated" : "checkpointed"
+        print(
+            "Batch \(batchNumber) \(batchAction): \(finalized.count) finalized, "
+                + "\(carriedCandidates.count) carried forward, \(batchSummary.selected) selected"
         )
     }
 
-    let summary = Summary(
-        discovered: discovered.count,
-        analyzed: candidates.count,
-        selected: candidates.filter(\.selected).count,
-        skipped: candidates.filter { !$0.selected }.count,
-        copied: copied,
-        alreadyPresent: alreadyPresent,
-        failed: failures.count,
-        degradedPhotos: candidates.filter {
-            $0.kind == .image && $0.analysis.analysisMode != .full
-        }.count,
-        selectedByDateAndTopic: selectedByDateAndTopic
-    )
-    let manifest = RunManifest(
-        schemaVersion: 3,
-        generatedAt: isoDate(Date()),
-        inputRoot: options.input.path,
-        outputRoot: options.output.path,
-        dryRun: options.dryRun,
-        settings: Settings(
-            selectionRatio: options.ratio,
-            maximumPerTopic: options.maxPerTopic,
-            photoAnalysisMaxPixels: options.photoMaxPixels,
-            nearDuplicateSeconds: settingsNearDuplicateSeconds,
-            nearDuplicateDistance: settingsNearDuplicateDistance
-        ),
-        summary: summary,
-        assets: records,
-        failures: failures
-    )
-
     if !options.dryRun {
-        try writeManifest(manifest, output: options.output)
+        if batchesThisRun == 0 {
+            try writeJSON(checkpoint, to: options.output.appendingPathComponent(checkpointFileName))
+            try writeRunManifest(checkpoint: checkpoint, discovered: discovered, options: options)
+        }
     }
 
+    let summary = aggregateSummary(checkpoint: checkpoint, discovered: discovered)
+    print("Complete: \(summary.completed)/\(summary.discovered), remaining: \(summary.remaining), boundary pending: \(summary.pendingBoundary)")
     print("Analyzed: \(summary.analyzed), selected: \(summary.selected), skipped: \(summary.skipped), failed: \(summary.failed)")
     if summary.degradedPhotos > 0 {
         print("Photos kept with partial or basic fallback analysis: \(summary.degradedPhotos)")
@@ -956,15 +1404,22 @@ func run() async throws {
     if !options.dryRun {
         print("Copied: \(summary.copied), already present: \(summary.alreadyPresent)")
     }
-    for date in selectedByDateAndTopic.keys.sorted() {
+    for date in summary.selectedByDateAndTopic.keys.sorted() {
         print("\(date):")
-        for (topic, count) in (selectedByDateAndTopic[date] ?? [:]).sorted(by: { $0.key < $1.key }) {
+        for (topic, count) in (summary.selectedByDateAndTopic[date] ?? [:]).sorted(by: { $0.key < $1.key }) {
             print("  \(topic): \(count)")
         }
     }
-    if !failures.isEmpty {
-        print("Failures:")
-        for failure in failures { print("  \(failure)") }
+    if !runFailures.isEmpty {
+        print("Failures in this run:")
+        for failure in runFailures { print("  \(failure.source): \(failure.error)") }
+    }
+    if batchesThisRun < workBatches.count {
+        print("Stopped after \(batchesThisRun) batch(es) as requested; run the same command again to resume.")
+    } else if summary.remaining == 0 && summary.pendingBoundary == 0 {
+        print("All current media is checkpointed.")
+    } else if batchesThisRun == 0 {
+        print("No new or changed media to analyze.")
     }
 }
 

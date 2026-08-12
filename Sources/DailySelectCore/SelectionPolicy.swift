@@ -7,6 +7,30 @@ public func photoAnalysisPixelSizes(maximum: Int) -> [Int] {
     return candidates.filter { seen.insert($0).inserted }
 }
 
+public struct SourceFingerprint: Codable, Equatable, Sendable {
+    public let byteSize: Int64
+    public let modificationTime: TimeInterval
+
+    public init(byteSize: Int64, modificationTime: TimeInterval) {
+        self.byteSize = byteSize
+        self.modificationTime = modificationTime
+    }
+}
+
+public func checkpointMatches(
+    stored: SourceFingerprint?,
+    current: SourceFingerprint
+) -> Bool {
+    stored == current
+}
+
+public func batchSlices<T>(_ items: [T], batchSize: Int) -> [ArraySlice<T>] {
+    precondition(batchSize > 0)
+    return stride(from: 0, to: items.count, by: batchSize).map { start in
+        items[start..<min(start + batchSize, items.count)]
+    }
+}
+
 public enum FaceAppearance: String, Sendable {
     case noFaceDetected = "no-face-detected"
     case noEyewear = "no-eyewear"

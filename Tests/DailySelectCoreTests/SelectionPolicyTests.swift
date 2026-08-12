@@ -2,6 +2,13 @@ import Foundation
 import Testing
 @testable import DailySelectCore
 
+@Test func createsDescendingPhotoAnalysisRetrySizes() {
+    #expect(photoAnalysisPixelSizes(maximum: 2_048) == [2_048, 1_536, 1_024])
+    #expect(photoAnalysisPixelSizes(maximum: 1_536) == [1_536, 1_024])
+    #expect(photoAnalysisPixelSizes(maximum: 1_024) == [1_024])
+    #expect(photoAnalysisPixelSizes(maximum: 3_000) == [3_000, 2_048, 1_536, 1_024])
+}
+
 @Test func classifiesFaceAppearance() {
     #expect(faceAppearance(faceCount: 0, eyewearConfidence: 0.9) == .noFaceDetected)
     #expect(faceAppearance(faceCount: 3, eyewearConfidence: 0.004) == .noEyewear)

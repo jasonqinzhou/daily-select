@@ -1,5 +1,12 @@
 import Foundation
 
+public func photoAnalysisPixelSizes(maximum: Int) -> [Int] {
+    precondition(maximum > 0)
+    let candidates = [maximum, min(maximum, 2_048), min(maximum, 1_536), min(maximum, 1_024)]
+    var seen: Set<Int> = []
+    return candidates.filter { seen.insert($0).inserted }
+}
+
 public enum FaceAppearance: String, Sendable {
     case noFaceDetected = "no-face-detected"
     case noEyewear = "no-eyewear"

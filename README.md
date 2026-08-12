@@ -25,6 +25,7 @@ thumbnails, metadata, or model requests leave your Mac.
 - Face-quality and eyewear-appearance diversity within large bursts
 - Broad semantic balancing so one day is not filled with only one kind of shot
 - Frame sampling for MOV, MP4, and M4V video
+- Memory-bounded photo thumbnails with automatic smaller-size retries
 - Flat `YYYY-MM-DD` output folders with byte-identical copies
 - An auditable JSON manifest containing scores, labels, groups, and decisions
 - Idempotent reruns: existing identical selections are reused
@@ -62,6 +63,7 @@ The input and output directories must not overlap.
 --dry-run                 Analyze without copying
 --ratio 0.35              Fraction selected within each date/topic balance
 --max-per-topic 12        Maximum selected within each internal topic balance
+--photo-max-pixels 2048   Longest edge used for photo analysis (minimum: 512)
 -h, --help                Show command help
 ```
 
@@ -75,8 +77,9 @@ Example:
 
 1. ImageIO reads capture dates, falling back to timestamped filenames and then
    filesystem dates.
-2. Vision scores aesthetics, identifies utility images, produces broad content
-   labels, and generates visual feature prints.
+2. ImageIO creates a memory-bounded, orientation-correct thumbnail for photo
+   analysis. Vision scores aesthetics, identifies utility images, produces
+   broad content labels, and generates visual feature prints.
 3. Photos containing people receive an overlapping tiled face scan. Face crops
    are analyzed for capture quality and eyewear appearance, allowing a strong
    no-eyewear frame and a strong eyewear frame to survive the same burst.
@@ -85,7 +88,8 @@ Example:
    composition only when it is sufficiently different.
 5. Broad internal topics balance people, food, nature, travel, animals, and
    other moments. These topics never create output subfolders.
-6. Selected originals are copied without transcoding or recompression.
+6. Selected originals are copied without transcoding or recompression. The
+   analysis thumbnail never replaces or changes the original photo.
 
 For videos, AVFoundation samples frames near the beginning, middle, and end,
 then copies the complete original video when selected.
@@ -101,6 +105,7 @@ Each run writes `_daily-select-manifest.json` in the output root. It records:
 - Near-duplicate group identifiers
 - Selection or rejection reason
 - Run settings, counts, and failures
+- Whether each asset received full, partial, or basic fallback analysis
 
 The manifest is local and may contain absolute filesystem paths. Review it
 before sharing it publicly.
@@ -114,6 +119,12 @@ The selector cannot know the personal meaning of a moment. Its decisions are
 based on technical quality, visual difference, face appearance, and broad
 content balance. It intentionally copies rather than deletes, so originals
 remain available when its judgment differs from yours.
+
+If an older Mac reports `failed to create CVPixelBufferPool`, pull the latest
+version and rebuild. Daily Select now limits photo-analysis memory, performs
+Vision requests sequentially, retries smaller thumbnails, and keeps decodable
+photos eligible through a basic fallback even if Vision remains unavailable.
+For an especially memory-constrained machine, add `--photo-max-pixels 1024`.
 
 ## Development
 

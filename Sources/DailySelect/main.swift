@@ -1,5 +1,4 @@
 import AVFoundation
-import CoreImage
 import DailySelectCore
 import Foundation
 import ImageIO
@@ -20,6 +19,12 @@ struct LabelScore: Codable {
     let confidence: Float
 }
 
+enum AnalysisMode: String, Codable {
+    case full
+    case partial
+    case basicFallback = "basic-fallback"
+}
+
 struct FrameAnalysis {
     let aesthetics: Float
     let isUtility: Bool
@@ -28,6 +33,7 @@ struct FrameAnalysis {
     let eyewearConfidence: Float
     let labels: [LabelScore]
     let featurePrint: VNFeaturePrintObservation?
+    let analysisMode: AnalysisMode
 }
 
 final class Candidate {
@@ -55,6 +61,7 @@ final class Candidate {
 struct Settings: Codable {
     let selectionRatio: Double
     let maximumPerTopic: Int
+    let photoAnalysisMaxPixels: Int
     let nearDuplicateSeconds: Double
     let nearDuplicateDistance: Float
 }
@@ -72,6 +79,7 @@ struct AssetRecord: Codable {
     let appearanceVariant: String
     let utilityImage: Bool
     let labels: [LabelScore]
+    let analysisMode: String
     let duplicateGroup: String
     let selected: Bool
     let decision: String
@@ -86,6 +94,7 @@ struct Summary: Codable {
     let copied: Int
     let alreadyPresent: Int
     let failed: Int
+    let degradedPhotos: Int
     let selectedByDateAndTopic: [String: [String: Int]]
 }
 
@@ -107,6 +116,7 @@ struct Options {
     let dryRun: Bool
     let ratio: Double
     let maxPerTopic: Int
+    let photoMaxPixels: Int
 }
 
 enum DailySelectError: Error, CustomStringConvertible {
@@ -126,7 +136,7 @@ private let settingsNearDuplicateSeconds = 180.0
 private let settingsNearDuplicateDistance: Float = 0.36
 private let eyewearThreshold: Float = 0.45
 private let distinctViewDistance: Float = 0.25
-private let imageContext = CIContext(options: [.useSoftwareRenderer: false])
+private let defaultPhotoMaxPixels = 2_048
 
 func expandedURL(_ path: String) -> URL {
     let expanded = NSString(string: path).expandingTildeInPath
@@ -138,6 +148,7 @@ func parseOptions() throws -> Options {
     var dryRun = false
     var ratio = 0.35
     var maxPerTopic = 12
+    var photoMaxPixels = defaultPhotoMaxPixels
     var iterator = CommandLine.arguments.dropFirst().makeIterator()
 
     while let argument = iterator.next() {
@@ -154,6 +165,11 @@ func parseOptions() throws -> Options {
                 throw DailySelectError.usage("--max-per-topic must be a positive integer")
             }
             maxPerTopic = parsed
+        case "--photo-max-pixels":
+            guard let value = iterator.next(), let parsed = Int(value), parsed >= 512 else {
+                throw DailySelectError.usage("--photo-max-pixels must be an integer of at least 512")
+            }
+            photoMaxPixels = parsed
         case "--help", "-h":
             throw DailySelectError.usage(usage())
         default:
@@ -173,7 +189,14 @@ func parseOptions() throws -> Options {
         ? expandedURL(positional[1])
         : input.deletingLastPathComponent().appendingPathComponent("Daily Select", isDirectory: true)
 
-    return Options(input: input, output: output, dryRun: dryRun, ratio: ratio, maxPerTopic: maxPerTopic)
+    return Options(
+        input: input,
+        output: output,
+        dryRun: dryRun,
+        ratio: ratio,
+        maxPerTopic: maxPerTopic,
+        photoMaxPixels: photoMaxPixels
+    )
 }
 
 func usage() -> String {
@@ -184,6 +207,7 @@ func usage() -> String {
       --dry-run                 Analyze and report without copying files
       --ratio NUMBER            Target fraction selected per topic (default: 0.35)
       --max-per-topic NUMBER    Maximum selected per date/topic (default: 12)
+      --photo-max-pixels NUMBER Longest photo-analysis edge (default: 2048; minimum: 512)
       -h, --help                Show this help
 
     The input is always read-only. If OUTPUT_FOLDER is omitted, the tool creates
@@ -301,13 +325,28 @@ func expandedFaceRect(_ rect: CGRect, within extent: CGRect) -> CGRect {
     return rect.insetBy(dx: -horizontalPadding, dy: -verticalPadding).intersection(extent)
 }
 
+func cropImage(_ image: CGImage, visionRect: CGRect) -> CGImage? {
+    let imageBounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+    let bounded = visionRect.intersection(imageBounds)
+    guard !bounded.isNull, !bounded.isEmpty else { return nil }
+
+    // Vision rectangles use a lower-left origin. CGImage cropping uses the
+    // underlying bitmap's upper-left origin, so flip the vertical coordinate.
+    let cropRect = CGRect(
+        x: bounded.minX,
+        y: CGFloat(image.height) - bounded.maxY,
+        width: bounded.width,
+        height: bounded.height
+    ).integral.intersection(imageBounds)
+    return image.cropping(to: cropRect)
+}
+
 func detectFaceRects(in image: CGImage, seedFaces: [VNFaceObservation], useTiling: Bool) throws -> [CGRect] {
     let width = CGFloat(image.width)
     let height = CGFloat(image.height)
     var faces = seedFaces.map { VNImageRectForNormalizedRect($0.boundingBox, image.width, image.height) }
     guard useTiling else { return faces }
 
-    let ciImage = CIImage(cgImage: image)
     let tileFraction: CGFloat = 0.45
     let positions: [CGFloat] = [0, 0.275, 0.55]
     for horizontalPosition in positions {
@@ -318,7 +357,7 @@ func detectFaceRects(in image: CGImage, seedFaces: [VNFaceObservation], useTilin
                 width: width * tileFraction,
                 height: height * tileFraction
             )
-            guard let tile = imageContext.createCGImage(ciImage.cropped(to: tileRect), from: tileRect) else { continue }
+            guard let tile = cropImage(image, visionRect: tileRect) else { continue }
             let request = VNDetectFaceRectanglesRequest()
             try VNImageRequestHandler(cgImage: tile).perform([request])
 
@@ -339,16 +378,17 @@ func analyzeFaces(in image: CGImage, seedFaces: [VNFaceObservation], useTiling: 
     let faceRects = try detectFaceRects(in: image, seedFaces: seedFaces, useTiling: useTiling)
     guard !faceRects.isEmpty else { return FaceMetrics(count: 0, maximumQuality: nil, eyewearConfidence: 0) }
 
-    let ciImage = CIImage(cgImage: image)
+    let imageBounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
     var qualities: [Float] = []
     var maximumEyewearConfidence: Float = 0
 
     for rect in faceRects {
-        let cropRect = expandedFaceRect(rect, within: ciImage.extent)
-        guard let crop = imageContext.createCGImage(ciImage.cropped(to: cropRect), from: cropRect) else { continue }
+        let cropRect = expandedFaceRect(rect, within: imageBounds)
+        guard let crop = cropImage(image, visionRect: cropRect) else { continue }
         let quality = VNDetectFaceCaptureQualityRequest()
         let classification = VNClassifyImageRequest()
-        try VNImageRequestHandler(cgImage: crop).perform([quality, classification])
+        try VNImageRequestHandler(cgImage: crop).perform([quality])
+        try VNImageRequestHandler(cgImage: crop).perform([classification])
         qualities.append(contentsOf: (quality.results ?? []).compactMap(\.faceCaptureQuality))
 
         for label in classification.results ?? [] {
@@ -396,16 +436,121 @@ func analyzeFrame(_ cgImage: CGImage) throws -> FrameAnalysis {
         faceCount: faceMetrics.count,
         eyewearConfidence: faceMetrics.eyewearConfidence,
         labels: labels,
-        featurePrint: feature.results?.first
+        featurePrint: feature.results?.first,
+        analysisMode: .full
     )
 }
 
-func analyzeImage(_ url: URL) throws -> FrameAnalysis {
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-          let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
+func photoThumbnail(_ url: URL, maximumPixelSize: Int) throws -> CGImage {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
         throw DailySelectError.invalidPath("Cannot decode image: \(url.path)")
     }
-    return try analyzeFrame(image)
+
+    let thumbnailOptions: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceShouldAllowFloat: false
+    ]
+    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
+        throw DailySelectError.invalidPath("Cannot create analysis thumbnail: \(url.path)")
+    }
+    return image
+}
+
+func performVisionRequest(_ request: VNRequest, on image: CGImage) throws {
+    try VNImageRequestHandler(cgImage: image).perform([request])
+}
+
+func analyzePhotoFrame(_ cgImage: CGImage, bestEffort: Bool) throws -> FrameAnalysis {
+    let aesthetics = VNCalculateImageAestheticsScoresRequest()
+    let classifications = VNClassifyImageRequest()
+    let faces = VNDetectFaceRectanglesRequest()
+    let feature = VNGenerateImageFeaturePrintRequest()
+    let requests: [VNRequest] = [aesthetics, classifications, faces, feature]
+    var completedRequests = 0
+    var firstError: Error?
+
+    // Run requests one at a time to keep Vision's peak temporary-buffer use low.
+    for request in requests {
+        do {
+            try performVisionRequest(request, on: cgImage)
+            completedRequests += 1
+        } catch {
+            firstError = firstError ?? error
+            if !bestEffort { throw error }
+        }
+    }
+
+    let aestheticsResult = aesthetics.results?.first
+    let labels = (classifications.results ?? [])
+        .filter { $0.confidence >= 0.08 }
+        .prefix(15)
+        .map { LabelScore(label: $0.identifier, confidence: $0.confidence) }
+    let peopleSignal = labelMatches(
+        labels,
+        ["person", "people", "human", "portrait", "selfie", "family", "crowd", "child", "baby"]
+    )
+
+    var faceMetrics = FaceMetrics(
+        count: faces.results?.count ?? 0,
+        maximumQuality: nil,
+        eyewearConfidence: 0
+    )
+    var faceAnalysisFailed = false
+    if faces.results != nil {
+        do {
+            faceMetrics = try analyzeFaces(
+                in: cgImage,
+                seedFaces: faces.results ?? [],
+                useTiling: peopleSignal || !(faces.results ?? []).isEmpty
+            )
+        } catch {
+            firstError = firstError ?? error
+            faceAnalysisFailed = true
+            if !bestEffort { throw error }
+        }
+    }
+
+    if !bestEffort, let firstError { throw firstError }
+    let mode: AnalysisMode
+    if completedRequests == requests.count && !faceAnalysisFailed {
+        mode = .full
+    } else if completedRequests > 0 {
+        mode = .partial
+    } else {
+        mode = .basicFallback
+    }
+
+    return FrameAnalysis(
+        aesthetics: aestheticsResult?.overallScore ?? 0,
+        isUtility: aestheticsResult?.isUtility ?? false,
+        faceQuality: faceMetrics.maximumQuality,
+        faceCount: faceMetrics.count,
+        eyewearConfidence: faceMetrics.eyewearConfidence,
+        labels: labels,
+        featurePrint: feature.results?.first,
+        analysisMode: mode
+    )
+}
+
+func analyzeImage(_ url: URL, maximumPixelSize: Int) throws -> FrameAnalysis {
+    let sizes = photoAnalysisPixelSizes(maximum: maximumPixelSize)
+    var lastError: Error?
+
+    for (index, size) in sizes.enumerated() {
+        do {
+            return try autoreleasepool {
+                let image = try photoThumbnail(url, maximumPixelSize: size)
+                return try analyzePhotoFrame(image, bestEffort: index == sizes.count - 1)
+            }
+        } catch {
+            lastError = error
+        }
+    }
+
+    throw lastError ?? DailySelectError.invalidPath("Cannot analyze image: \(url.path)")
 }
 
 func analyzeVideo(_ url: URL) async throws -> FrameAnalysis {
@@ -439,7 +584,8 @@ func analyzeVideo(_ url: URL) async throws -> FrameAnalysis {
         faceCount: frames.map(\.faceCount).max() ?? 0,
         eyewearConfidence: frames.map(\.eyewearConfidence).max() ?? 0,
         labels: Array(combinedLabels),
-        featurePrint: frames[frames.count / 2].featurePrint
+        featurePrint: frames[frames.count / 2].featurePrint,
+        analysisMode: .full
     )
 }
 
@@ -696,7 +842,7 @@ func run() async throws {
         do {
             let analysis: FrameAnalysis
             if kind == .image {
-                analysis = try analyzeImage(url)
+                analysis = try analyzeImage(url, maximumPixelSize: options.photoMaxPixels)
             } else {
                 analysis = try await analyzeVideo(url)
             }
@@ -760,6 +906,7 @@ func run() async throws {
             appearanceVariant: appearanceVariant(candidate),
             utilityImage: candidate.analysis.isUtility,
             labels: candidate.analysis.labels,
+            analysisMode: candidate.analysis.analysisMode.rawValue,
             duplicateGroup: candidate.groupID,
             selected: candidate.selected,
             decision: candidate.decision,
@@ -775,10 +922,13 @@ func run() async throws {
         copied: copied,
         alreadyPresent: alreadyPresent,
         failed: failures.count,
+        degradedPhotos: candidates.filter {
+            $0.kind == .image && $0.analysis.analysisMode != .full
+        }.count,
         selectedByDateAndTopic: selectedByDateAndTopic
     )
     let manifest = RunManifest(
-        schemaVersion: 2,
+        schemaVersion: 3,
         generatedAt: isoDate(Date()),
         inputRoot: options.input.path,
         outputRoot: options.output.path,
@@ -786,6 +936,7 @@ func run() async throws {
         settings: Settings(
             selectionRatio: options.ratio,
             maximumPerTopic: options.maxPerTopic,
+            photoAnalysisMaxPixels: options.photoMaxPixels,
             nearDuplicateSeconds: settingsNearDuplicateSeconds,
             nearDuplicateDistance: settingsNearDuplicateDistance
         ),
@@ -799,6 +950,9 @@ func run() async throws {
     }
 
     print("Analyzed: \(summary.analyzed), selected: \(summary.selected), skipped: \(summary.skipped), failed: \(summary.failed)")
+    if summary.degradedPhotos > 0 {
+        print("Photos kept with partial or basic fallback analysis: \(summary.degradedPhotos)")
+    }
     if !options.dryRun {
         print("Copied: \(summary.copied), already present: \(summary.alreadyPresent)")
     }

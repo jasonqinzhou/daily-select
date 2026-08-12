@@ -24,6 +24,13 @@ public func checkpointMatches(
     stored == current
 }
 
+public func sourceCheckpointKey(inputRoot: String, relativePath: String) -> String {
+    URL(fileURLWithPath: inputRoot, isDirectory: true)
+        .appendingPathComponent(relativePath)
+        .standardizedFileURL
+        .path
+}
+
 public func batchSlices<T>(_ items: [T], batchSize: Int) -> [ArraySlice<T>] {
     precondition(batchSize > 0)
     return stride(from: 0, to: items.count, by: batchSize).map { start in

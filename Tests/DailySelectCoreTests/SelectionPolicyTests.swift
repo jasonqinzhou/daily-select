@@ -66,3 +66,11 @@ import Testing
         current: SourceFingerprint(byteSize: 42, modificationTime: 101)
     ))
 }
+
+@Test func checkpointKeysSeparateInputRoots() {
+    let first = sourceCheckpointKey(inputRoot: "/Volumes/Camera A", relativePath: "DCIM/IMG_0001.JPG")
+    let second = sourceCheckpointKey(inputRoot: "/Volumes/Camera B", relativePath: "DCIM/IMG_0001.JPG")
+    #expect(first == "/Volumes/Camera A/DCIM/IMG_0001.JPG")
+    #expect(second == "/Volumes/Camera B/DCIM/IMG_0001.JPG")
+    #expect(first != second)
+}

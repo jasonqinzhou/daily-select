@@ -38,6 +38,7 @@ struct FrameAnalysis {
 
 final class Candidate {
     let sourceURL: URL
+    let sourceRoot: String
     let relativePath: String
     let fingerprint: SourceFingerprint
     let kind: MediaKind
@@ -53,6 +54,7 @@ final class Candidate {
 
     init(
         sourceURL: URL,
+        sourceRoot: String,
         relativePath: String,
         fingerprint: SourceFingerprint,
         kind: MediaKind,
@@ -61,12 +63,17 @@ final class Candidate {
         analysis: FrameAnalysis
     ) {
         self.sourceURL = sourceURL
+        self.sourceRoot = sourceRoot
         self.relativePath = relativePath
         self.fingerprint = fingerprint
         self.kind = kind
         self.captureDate = captureDate
         self.byteSize = byteSize
         self.analysis = analysis
+    }
+
+    var checkpointKey: String {
+        sourceCheckpointKey(inputRoot: sourceRoot, relativePath: relativePath)
     }
 }
 
@@ -82,6 +89,7 @@ struct Settings: Codable, Equatable {
 
 struct AssetRecord: Codable {
     let source: String
+    let sourceRoot: String
     let relativePath: String
     let captureDate: String
     let mediaType: String
@@ -120,6 +128,7 @@ struct RunManifest: Codable {
     let schemaVersion: Int
     let generatedAt: String
     let inputRoot: String
+    let inputRoots: [String]
     let outputRoot: String
     let dryRun: Bool
     let settings: Settings
@@ -130,10 +139,15 @@ struct RunManifest: Codable {
 
 struct SourceDescriptor {
     let sourceURL: URL
+    let sourceRoot: String
     let relativePath: String
     let kind: MediaKind
     let captureDate: Date
     let fingerprint: SourceFingerprint
+
+    var checkpointKey: String {
+        sourceCheckpointKey(inputRoot: sourceRoot, relativePath: relativePath)
+    }
 }
 
 struct PersistedAnalysis: Codable {
@@ -148,6 +162,7 @@ struct PersistedAnalysis: Codable {
 }
 
 struct PendingCandidate: Codable {
+    var sourceRoot: String?
     let relativePath: String
     let fingerprint: SourceFingerprint
     let kind: MediaKind
@@ -195,13 +210,70 @@ struct BatchManifest: Codable {
 }
 
 struct CheckpointState: Codable {
-    let schemaVersion: Int
-    let inputRoot: String
+    var schemaVersion: Int
+    var inputRoots: [String]
     let settings: Settings
     var nextBatchNumber: Int
     var completed: [String: CompletedFile]
     var pending: [PendingCandidate]
     var batches: [BatchSummary]
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case inputRoot
+        case inputRoots
+        case settings
+        case nextBatchNumber
+        case completed
+        case pending
+        case batches
+    }
+
+    init(
+        schemaVersion: Int,
+        inputRoots: [String],
+        settings: Settings,
+        nextBatchNumber: Int,
+        completed: [String: CompletedFile],
+        pending: [PendingCandidate],
+        batches: [BatchSummary]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.inputRoots = inputRoots
+        self.settings = settings
+        self.nextBatchNumber = nextBatchNumber
+        self.completed = completed
+        self.pending = pending
+        self.batches = batches
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        if let roots = try container.decodeIfPresent([String].self, forKey: .inputRoots) {
+            inputRoots = roots
+        } else if let legacyRoot = try container.decodeIfPresent(String.self, forKey: .inputRoot) {
+            inputRoots = [legacyRoot]
+        } else {
+            inputRoots = []
+        }
+        settings = try container.decode(Settings.self, forKey: .settings)
+        nextBatchNumber = try container.decode(Int.self, forKey: .nextBatchNumber)
+        completed = try container.decode([String: CompletedFile].self, forKey: .completed)
+        pending = try container.decode([PendingCandidate].self, forKey: .pending)
+        batches = try container.decode([BatchSummary].self, forKey: .batches)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(inputRoots, forKey: .inputRoots)
+        try container.encode(settings, forKey: .settings)
+        try container.encode(nextBatchNumber, forKey: .nextBatchNumber)
+        try container.encode(completed, forKey: .completed)
+        try container.encode(pending, forKey: .pending)
+        try container.encode(batches, forKey: .batches)
+    }
 }
 
 struct Options {
@@ -324,7 +396,8 @@ func usage() -> String {
       -h, --help                Show this help
 
     The input is always read-only. If OUTPUT_FOLDER is omitted, the tool creates
-    a sibling folder named "Daily Select".
+    a sibling folder named "Daily Select". Separate input folders may share the
+    same output when they use the same selection settings.
     """
 }
 
@@ -380,6 +453,7 @@ func discoverMedia(in root: URL) throws -> [SourceDescriptor] {
         let modificationTime = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
         media.append(SourceDescriptor(
             sourceURL: url,
+            sourceRoot: root.path,
             relativePath: relativePath(for: url, under: root),
             kind: kind,
             captureDate: captureDate(for: url, kind: kind),
@@ -944,6 +1018,7 @@ func restoreFeaturePrint(_ data: Data?) throws -> VNFeaturePrintObservation? {
 
 func persistedCandidate(_ candidate: Candidate) throws -> PendingCandidate {
     PendingCandidate(
+        sourceRoot: candidate.sourceRoot,
         relativePath: candidate.relativePath,
         fingerprint: candidate.fingerprint,
         kind: candidate.kind,
@@ -967,6 +1042,7 @@ func restoredCandidate(_ pending: PendingCandidate, descriptor: SourceDescriptor
     guard checkpointMatches(stored: pending.fingerprint, current: descriptor.fingerprint) else { return nil }
     let candidate = Candidate(
         sourceURL: descriptor.sourceURL,
+        sourceRoot: descriptor.sourceRoot,
         relativePath: descriptor.relativePath,
         fingerprint: descriptor.fingerprint,
         kind: pending.kind,
@@ -1024,6 +1100,7 @@ func partitionForCheckpoint(
 func assetRecord(for candidate: Candidate) -> AssetRecord {
     AssetRecord(
         source: candidate.sourceURL.path,
+        sourceRoot: candidate.sourceRoot,
         relativePath: candidate.relativePath,
         captureDate: isoDate(candidate.captureDate),
         mediaType: candidate.kind.rawValue,
@@ -1058,19 +1135,21 @@ func mergedTopicCounts(_ batches: [BatchSummary]) -> [String: [String: Int]] {
 
 func aggregateSummary(
     checkpoint: CheckpointState,
-    discovered: [SourceDescriptor]
+    discovered: [SourceDescriptor],
+    currentInputRoot: String
 ) -> Summary {
-    let currentByPath = Dictionary(uniqueKeysWithValues: discovered.map { ($0.relativePath, $0) })
-    let completedCurrent = checkpoint.completed.filter { path, state in
-        guard let descriptor = currentByPath[path] else { return false }
+    let currentByKey = Dictionary(uniqueKeysWithValues: discovered.map { ($0.checkpointKey, $0) })
+    let completedCurrent = checkpoint.completed.filter { key, state in
+        guard let descriptor = currentByKey[key] else { return false }
         return checkpointMatches(stored: state.fingerprint, current: descriptor.fingerprint)
     }.count
+    let pendingCurrent = checkpoint.pending.filter { $0.sourceRoot == currentInputRoot }.count
     let batches = checkpoint.batches
     return Summary(
         discovered: discovered.count,
         completed: completedCurrent,
-        remaining: max(0, discovered.count - completedCurrent - checkpoint.pending.count),
-        pendingBoundary: checkpoint.pending.count,
+        remaining: max(0, discovered.count - completedCurrent - pendingCurrent),
+        pendingBoundary: pendingCurrent,
         analyzed: batches.reduce(0) { $0 + $1.newlyAnalyzed },
         selected: batches.reduce(0) { $0 + $1.selected },
         skipped: batches.reduce(0) { $0 + $1.skipped },
@@ -1115,8 +1194,8 @@ func loadCheckpoint(options: Options, settings: Settings) throws -> CheckpointSt
     let url = options.output.appendingPathComponent(checkpointFileName)
     guard FileManager.default.fileExists(atPath: url.path) else {
         return CheckpointState(
-            schemaVersion: 1,
-            inputRoot: options.input.path,
+            schemaVersion: 2,
+            inputRoots: [options.input.path],
             settings: settings,
             nextBatchNumber: 1,
             completed: [:],
@@ -1125,7 +1204,7 @@ func loadCheckpoint(options: Options, settings: Settings) throws -> CheckpointSt
         )
     }
 
-    let checkpoint: CheckpointState
+    var checkpoint: CheckpointState
     do {
         checkpoint = try JSONDecoder().decode(CheckpointState.self, from: Data(contentsOf: url))
     } catch {
@@ -1133,14 +1212,9 @@ func loadCheckpoint(options: Options, settings: Settings) throws -> CheckpointSt
             "Cannot read checkpoint at \(url.path): \(error). Move it aside to start a fresh output history."
         )
     }
-    guard checkpoint.schemaVersion == 1 else {
+    guard checkpoint.schemaVersion == 1 || checkpoint.schemaVersion == 2 else {
         throw DailySelectError.invalidPath(
             "Unsupported checkpoint schema \(checkpoint.schemaVersion) at \(url.path)"
-        )
-    }
-    guard checkpoint.inputRoot == options.input.path else {
-        throw DailySelectError.invalidPath(
-            "The output checkpoint belongs to a different input folder: \(checkpoint.inputRoot)"
         )
     }
     guard checkpoint.settings == settings else {
@@ -1148,6 +1222,27 @@ func loadCheckpoint(options: Options, settings: Settings) throws -> CheckpointSt
             "Selection settings differ from the existing checkpoint. Resume with the same --ratio, "
                 + "--max-per-topic, --photo-max-pixels, and --batch-size values, or choose a new output folder."
         )
+    }
+
+    if checkpoint.schemaVersion == 1 {
+        guard let legacyRoot = checkpoint.inputRoots.first else {
+            throw DailySelectError.invalidPath("The legacy checkpoint does not contain an input folder")
+        }
+        checkpoint.completed = Dictionary(uniqueKeysWithValues: checkpoint.completed.map { relativePath, state in
+            (sourceCheckpointKey(inputRoot: legacyRoot, relativePath: relativePath), state)
+        })
+        for index in checkpoint.pending.indices {
+            checkpoint.pending[index].sourceRoot = legacyRoot
+        }
+        checkpoint.schemaVersion = 2
+    }
+
+    guard checkpoint.pending.allSatisfy({ $0.sourceRoot != nil }) else {
+        throw DailySelectError.invalidPath("The checkpoint contains a boundary item without a source folder")
+    }
+    if !checkpoint.inputRoots.contains(options.input.path) {
+        checkpoint.inputRoots.append(options.input.path)
+        checkpoint.inputRoots.sort()
     }
     return checkpoint
 }
@@ -1158,13 +1253,18 @@ func writeRunManifest(
     options: Options
 ) throws {
     let manifest = RunManifest(
-        schemaVersion: 3,
+        schemaVersion: 4,
         generatedAt: isoDate(Date()),
         inputRoot: options.input.path,
+        inputRoots: checkpoint.inputRoots,
         outputRoot: options.output.path,
         dryRun: options.dryRun,
         settings: checkpoint.settings,
-        summary: aggregateSummary(checkpoint: checkpoint, discovered: discovered),
+        summary: aggregateSummary(
+            checkpoint: checkpoint,
+            discovered: discovered,
+            currentInputRoot: options.input.path
+        ),
         checkpoint: checkpointFileName,
         batchManifests: checkpoint.batches.map(\.manifest)
     )
@@ -1197,42 +1297,45 @@ func run() async throws {
     }
 
     var checkpoint = try loadCheckpoint(options: options, settings: settings)
-    let descriptorByPath = Dictionary(uniqueKeysWithValues: discovered.map { ($0.relativePath, $0) })
+    let descriptorByKey = Dictionary(uniqueKeysWithValues: discovered.map { ($0.checkpointKey, $0) })
+    let preservedPending = checkpoint.pending.filter { $0.sourceRoot != options.input.path }
 
     var carriedCandidates: [Candidate] = []
-    var validPendingPaths: Set<String> = []
-    for pending in checkpoint.pending {
-        guard let descriptor = descriptorByPath[pending.relativePath],
+    var validPendingKeys: Set<String> = []
+    for pending in checkpoint.pending where pending.sourceRoot == options.input.path {
+        let key = sourceCheckpointKey(inputRoot: options.input.path, relativePath: pending.relativePath)
+        guard let descriptor = descriptorByKey[key],
               checkpointMatches(stored: pending.fingerprint, current: descriptor.fingerprint) else {
             continue
         }
         do {
             if let candidate = try restoredCandidate(pending, descriptor: descriptor) {
                 carriedCandidates.append(candidate)
-                validPendingPaths.insert(pending.relativePath)
+                validPendingKeys.insert(key)
             }
         } catch {
             print("Checkpoint boundary entry will be analyzed again: \(pending.relativePath) (\(error))")
         }
     }
-    checkpoint.pending = try carriedCandidates.map(persistedCandidate)
+    checkpoint.pending = preservedPending + (try carriedCandidates.map(persistedCandidate))
 
-    let completedPaths = Set(discovered.compactMap { descriptor -> String? in
+    let completedKeys = Set(discovered.compactMap { descriptor -> String? in
         guard checkpointMatches(
-            stored: checkpoint.completed[descriptor.relativePath]?.fingerprint,
+            stored: checkpoint.completed[descriptor.checkpointKey]?.fingerprint,
             current: descriptor.fingerprint
         ) else { return nil }
-        return descriptor.relativePath
+        return descriptor.checkpointKey
     })
     let unprocessed = discovered.filter {
-        !completedPaths.contains($0.relativePath) && !validPendingPaths.contains($0.relativePath)
+        !completedKeys.contains($0.checkpointKey) && !validPendingKeys.contains($0.checkpointKey)
     }
 
     print("Daily Select")
     print("Input:  \(options.input.path)")
     print("Output: \(options.output.path)\(options.dryRun ? " (dry run)" : "")")
+    print("Registered input folders: \(checkpoint.inputRoots.count)")
     print("Found \(discovered.count) supported media files")
-    print("Resume state: \(completedPaths.count) complete, \(carriedCandidates.count) at a batch boundary, \(unprocessed.count) new or changed")
+    print("Resume state: \(completedKeys.count) complete, \(carriedCandidates.count) at a batch boundary, \(unprocessed.count) new or changed")
 
     var workBatches = batchSlices(unprocessed, batchSize: options.batchSize).map(Array.init)
     if workBatches.isEmpty && !carriedCandidates.isEmpty {
@@ -1263,6 +1366,7 @@ func run() async throws {
                 }
                 let candidate = Candidate(
                     sourceURL: descriptor.sourceURL,
+                    sourceRoot: descriptor.sourceRoot,
                     relativePath: descriptor.relativePath,
                     fingerprint: descriptor.fingerprint,
                     kind: descriptor.kind,
@@ -1346,7 +1450,7 @@ func run() async throws {
             selectedByDateAndTopic: selectedByDateAndTopic
         )
         let batchManifest = BatchManifest(
-            schemaVersion: 1,
+            schemaVersion: 2,
             generatedAt: isoDate(Date()),
             inputRoot: options.input.path,
             outputRoot: options.output.path,
@@ -1356,20 +1460,20 @@ func run() async throws {
         )
 
         for candidate in finalized {
-            checkpoint.completed[candidate.relativePath] = CompletedFile(
+            checkpoint.completed[candidate.checkpointKey] = CompletedFile(
                 fingerprint: candidate.fingerprint,
                 batchNumber: batchNumber,
                 outcome: candidate.selected ? "selected" : "skipped"
             )
         }
         for item in failedDescriptors {
-            checkpoint.completed[item.descriptor.relativePath] = CompletedFile(
+            checkpoint.completed[item.descriptor.checkpointKey] = CompletedFile(
                 fingerprint: item.descriptor.fingerprint,
                 batchNumber: batchNumber,
                 outcome: "failed"
             )
         }
-        checkpoint.pending = try carriedCandidates.map(persistedCandidate)
+        checkpoint.pending = preservedPending + (try carriedCandidates.map(persistedCandidate))
         checkpoint.batches.append(batchSummary)
         checkpoint.nextBatchNumber += 1
 
@@ -1395,7 +1499,11 @@ func run() async throws {
         }
     }
 
-    let summary = aggregateSummary(checkpoint: checkpoint, discovered: discovered)
+    let summary = aggregateSummary(
+        checkpoint: checkpoint,
+        discovered: discovered,
+        currentInputRoot: options.input.path
+    )
     print("Complete: \(summary.completed)/\(summary.discovered), remaining: \(summary.remaining), boundary pending: \(summary.pendingBoundary)")
     print("Analyzed: \(summary.analyzed), selected: \(summary.selected), skipped: \(summary.skipped), failed: \(summary.failed)")
     if summary.degradedPhotos > 0 {

@@ -26,6 +26,7 @@ thumbnails, metadata, or model requests leave your Mac.
 - Broad semantic balancing so one day is not filled with only one kind of shot
 - Frame sampling for MOV, MP4, and M4V video
 - Memory-bounded photo thumbnails with automatic smaller-size retries
+- Multiple independent camera folders sharing one resumable output library
 - Flat `YYYY-MM-DD` output folders with byte-identical copies
 - Bounded analysis batches with an atomic checkpoint after every batch
 - Safe resume after interruption: unchanged completed media is not analyzed again
@@ -59,6 +60,19 @@ You can also use the wrapper:
 
 The input and output directories must not overlap.
 
+You can send several separate camera folders into the same output. Run each
+source independently and reuse the exact same output path:
+
+```bash
+.build/release/daily-select "/Volumes/iPhone Export" "/path/to/Daily Select"
+.build/release/daily-select "/Volumes/Sony SD Card/DCIM" "/path/to/Daily Select"
+.build/release/daily-select "/Volumes/GoPro" "/path/to/Daily Select"
+```
+
+Daily Select registers every input root in the shared checkpoint and tracks a
+file by both its source root and relative path. The commands can be run in any
+order and do not require the source folders to share a common parent.
+
 ## Options
 
 ```text
@@ -90,6 +104,11 @@ changed files are analyzed. A small set of candidates near the chronological
 batch boundary is carried into the next batch so a burst split at item 1,000 is
 still compared together. The source folder remains read-only throughout.
 
+Changing to another input folder does not discard an unfinished boundary from
+the previous folder. Return to either source later and its checkpoint resumes
+independently. Checkpoints written by the earlier single-source release are
+upgraded automatically the next time the tool runs.
+
 For a scheduled or deliberately bounded run, process one batch per invocation:
 
 ```bash
@@ -98,9 +117,9 @@ For a scheduled or deliberately bounded run, process one batch per invocation:
 ```
 
 `--ratio`, `--max-per-topic`, `--photo-max-pixels`, and `--batch-size` are part
-of the checkpointed selection policy. Resume with the same values. To use
-different policy settings, choose a new output folder so results from two
-policies are not mixed.
+of the checkpointed selection policy. Use the same values for every input that
+shares an output. To use different policy settings, choose a new output folder
+so results from two policies are not mixed.
 
 ## How selection works
 
@@ -120,6 +139,12 @@ policies are not mixed.
 6. Selected originals are copied without transcoding or recompression. The
    analysis thumbnail never replaces or changes the original photo.
 
+Existing daily folders are additive. When a selected filename already exists,
+identical contents are reused; different contents are saved with a numeric
+suffix such as `IMG_0001-2.JPG`. Existing media is never overwritten. Each
+input folder is selected independently, so selections already copied from an
+older source are not retroactively re-ranked when a new source is added.
+
 For videos, AVFoundation samples frames near the beginning, middle, and end,
 then copies the complete original video when selected.
 
@@ -138,9 +163,10 @@ batch manifests record:
 - Whether each asset received full, partial, or basic fallback analysis
 
 The compact `_daily-select-manifest.json` is the current run index and cumulative
-summary. `_daily-select-checkpoint.json` is the machine-readable resume state.
-Both are updated atomically after the selected originals and batch manifest are
-successfully written.
+summary. It records the current input plus all input roots registered with the
+shared output. `_daily-select-checkpoint.json` is the machine-readable resume
+state. Both are updated atomically after the selected originals and batch
+manifest are successfully written.
 
 The manifests and checkpoint are local and may contain absolute filesystem
 paths. Review them before sharing them publicly.
